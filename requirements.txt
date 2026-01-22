@@ -1,3 +1,7 @@
 discord.py[voice]
 yt-dlp
 PyNaCl
+spotipy
+python-dotenv
+Pillow
+websockets

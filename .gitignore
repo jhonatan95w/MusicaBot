@@ -8,6 +8,10 @@
 # Arquivos de comunicação bot/dashboard
 .bot_status.json
 .bot_command.json
+.dashboard_config.json
+
+# Banco de dados
+music_bot.db
 
 # Python
 __pycache__/

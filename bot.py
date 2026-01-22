@@ -10,7 +10,25 @@ from spotipy.oauth2 import SpotifyClientCredentials
 import os
 import sys
 import json
+import time
 from dotenv import load_dotenv
+
+# WebSocket para comunicação com dashboard
+try:
+    import websockets
+    WEBSOCKET_AVAILABLE = True
+except ImportError:
+    WEBSOCKET_AVAILABLE = False
+    print("⚠️ websockets não instalado - usando fallback JSON")
+
+# Banco de dados para histórico e favoritos
+try:
+    from database import db
+    DATABASE_AVAILABLE = True
+except ImportError:
+    DATABASE_AVAILABLE = False
+    db = None
+    print("⚠️ database.py não encontrado - histórico desabilitado")
 
 # Configurar encoding UTF-8 para o console do Windows
 if sys.platform == 'win32':
@@ -75,9 +93,11 @@ class YTDLSource(discord.PCMVolumeTransformer):
         self.title = data.get('title')
         self.url = data.get('url')
         self.original_url = data.get('webpage_url', data.get('url'))
+        self.duration = data.get('duration', 0)
+        self.thumbnail = data.get('thumbnail')
 
     @classmethod
-    async def from_url(cls, url, *, loop=None, stream=True):
+    async def from_url(cls, url, *, loop=None, stream=True, volume=0.5):
         loop = loop or asyncio.get_event_loop()
 
         partial_data = await loop.run_in_executor(
@@ -93,7 +113,7 @@ class YTDLSource(discord.PCMVolumeTransformer):
                 raise Exception("Nenhum resultado encontrado")
             partial_data = partial_data['entries'][0]
 
-        return cls(discord.FFmpegPCMAudio(partial_data['url'], **ffmpeg_options), data=partial_data)
+        return cls(discord.FFmpegPCMAudio(partial_data['url'], **ffmpeg_options), data=partial_data, volume=volume)
 
 # Sistema de filas por servidor
 music_queues = {}
@@ -110,33 +130,133 @@ active_voice_client = None
 last_voice_channel_id = None  # Armazena o último canal de voz para reconexão via dashboard
 last_text_channel_id = None  # Armazena o último canal de texto para mensagens via dashboard
 
+# Informações da música atual para o dashboard
+current_song_start_time = None  # Timestamp de quando a música começou
+current_song_duration = 0  # Duração em segundos
+current_song_thumbnail = None  # URL da thumbnail
+current_volume = 0.5  # Volume atual (0.0 a 1.0)
+songs_played_count = 0  # Contador de músicas tocadas
+
+# WebSocket
+WEBSOCKET_PORT = 8765
+WEBSOCKET_HOST = "0.0.0.0"  # Aceita conexões de qualquer IP
+websocket_clients = {}  # {client_id: {"websocket": ws, "connected_at": timestamp, "name": str, "is_host": bool}}
+next_client_id = 1
+
+def get_host_client_id():
+    """Retorna o ID do cliente host (mais antigo conectado)"""
+    if not websocket_clients:
+        return None
+    # Encontrar o cliente mais antigo
+    oldest_id = min(websocket_clients.keys(), key=lambda cid: websocket_clients[cid]["connected_at"])
+    return oldest_id
+
+def is_host(client_id):
+    """Verifica se o cliente é o host"""
+    return client_id == get_host_client_id()
+
+def get_users_list():
+    """Retorna lista de usuários conectados"""
+    users = []
+    host_id = get_host_client_id()
+    for cid, data in websocket_clients.items():
+        users.append({
+            "id": cid,
+            "name": data.get("name", f"Usuário {cid}"),
+            "is_host": cid == host_id,
+            "connected_at": data["connected_at"]
+        })
+    # Ordenar por tempo de conexão
+    users.sort(key=lambda u: u["connected_at"])
+    return users
+
+async def broadcast_status(status_data):
+    """Envia status para todos os clientes WebSocket conectados"""
+    if websocket_clients:
+        # Adicionar informações de usuários ao status
+        status_data["users"] = get_users_list()
+        status_data["total_users"] = len(websocket_clients)
+        message = json.dumps(status_data)
+        await asyncio.gather(
+            *[client["websocket"].send(message) for client in websocket_clients.values()],
+            return_exceptions=True
+        )
+
+async def broadcast_users_update():
+    """Envia atualização da lista de usuários para todos"""
+    users_data = {
+        "type": "users_update",
+        "users": get_users_list(),
+        "total_users": len(websocket_clients)
+    }
+    message = json.dumps(users_data)
+    await asyncio.gather(
+        *[client["websocket"].send(message) for client in websocket_clients.values()],
+        return_exceptions=True
+    )
+
 def update_dashboard_status(guild_id=None):
     """Atualiza o arquivo de status para o dashboard"""
+    import time
     try:
         status = {
             "current_song": None,
+            "current_song_url": None,
             "is_paused": False,
-            "queue": []
+            "queue": [],
+            "duration": 0,
+            "start_time": None,
+            "thumbnail": None,
+            "volume": current_volume,
+            "voice_channel": None,
+            "songs_played": songs_played_count,
+            "guilds": [],
+            "active_guild_id": None
         }
-        
+
+        # Lista de servidores disponíveis
+        for guild in bot.guilds:
+            guild_info = {
+                "id": guild.id,
+                "name": guild.name,
+                "has_voice": guild.voice_client is not None,
+                "voice_channel": guild.voice_client.channel.name if guild.voice_client and guild.voice_client.channel else None
+            }
+            status["guilds"].append(guild_info)
+
         gid = guild_id or active_guild_id
+        status["active_guild_id"] = gid
+
         if gid and gid in music_queues:
             queue = music_queues[gid]
             current = queue.get_current()
             if current:
                 status["current_song"] = current.get("title", "Música desconhecida")
-            
+                status["current_song_url"] = current.get("url")
+                status["thumbnail"] = current.get("thumbnail")
+                status["duration"] = current.get("duration", 0)
+
             queue_list = queue.get_queue()
             status["queue"] = [s.get("title", "?") for s in queue_list[:10]]
-            
-            # Verificar se está pausado
+
+            # Verificar se está pausado e obter canal de voz
             for guild in bot.guilds:
                 if guild.id == gid and guild.voice_client:
                     status["is_paused"] = guild.voice_client.is_paused()
+                    status["voice_channel"] = guild.voice_client.channel.name if guild.voice_client.channel else None
                     break
-        
+
+        # Adicionar timestamp de início
+        if current_song_start_time:
+            status["start_time"] = current_song_start_time
+
+        # Salvar em arquivo (fallback)
         with open(STATUS_FILE, 'w', encoding='utf-8') as f:
             json.dump(status, f, ensure_ascii=False)
+
+        # Enviar via WebSocket
+        if WEBSOCKET_AVAILABLE and websocket_clients:
+            asyncio.create_task(broadcast_status(status))
     except Exception as e:
         print(f"Erro ao atualizar status: {e}")
 
@@ -289,7 +409,8 @@ def is_spotify_url(url):
     return any(re.search(pattern, url) for pattern in spotify_patterns)
 
 async def play_next(guild, voice_client):
-    global active_guild_id
+    global active_guild_id, current_song_start_time, songs_played_count
+    import time
     queue = get_queue(guild.id)
     active_guild_id = guild.id
 
@@ -309,9 +430,22 @@ async def play_next(guild, voice_client):
 
     if next_song:
         try:
-            player = await YTDLSource.from_url(next_song['url'], loop=bot.loop, stream=True)
+            current_song_start_time = time.time()
+            songs_played_count += 1
+            player = await YTDLSource.from_url(next_song['url'], loop=bot.loop, stream=True, volume=current_volume)
             voice_client.play(player, after=lambda e: asyncio.run_coroutine_threadsafe(play_next(guild, voice_client), bot.loop))
-            
+
+            # Salvar no histórico
+            if DATABASE_AVAILABLE and db:
+                db.add_to_history(
+                    title=next_song.get('title', 'Desconhecido'),
+                    url=next_song.get('url'),
+                    thumbnail=next_song.get('thumbnail'),
+                    duration=next_song.get('duration', 0),
+                    guild_id=guild.id,
+                    guild_name=guild.name
+                )
+
             # Atualizar dashboard
             update_dashboard_status(guild.id)
 
@@ -535,6 +669,246 @@ class MusicControls(discord.ui.View):
 
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
+# WebSocket Handler
+async def handle_websocket_command(command, data):
+    """Processa comandos recebidos via WebSocket"""
+    global active_guild_id, current_volume, current_song_start_time, songs_played_count
+
+    target_guild_id = data.get("guild_id")
+    voice_client = None
+    guild = None
+
+    if target_guild_id:
+        guild = bot.get_guild(target_guild_id)
+        if guild:
+            voice_client = guild.voice_client
+            active_guild_id = guild.id
+    else:
+        for g in bot.guilds:
+            if g.voice_client:
+                voice_client = g.voice_client
+                guild = g
+                active_guild_id = g.id
+                break
+
+    if command == "select_guild":
+        new_guild_id = data.get("guild_id")
+        if new_guild_id:
+            active_guild_id = new_guild_id
+            update_dashboard_status(new_guild_id)
+        return {"success": True}
+
+    elif command == "skip" and voice_client:
+        if voice_client.is_playing() or voice_client.is_paused():
+            voice_client.stop()
+        return {"success": True}
+
+    elif command == "pause" and voice_client:
+        if voice_client.is_playing():
+            voice_client.pause()
+            update_dashboard_status(guild.id)
+        return {"success": True}
+
+    elif command == "resume" and voice_client:
+        if voice_client.is_paused():
+            voice_client.resume()
+            update_dashboard_status(guild.id)
+        return {"success": True}
+
+    elif command == "volume" and voice_client:
+        new_volume = data.get("value", 0.5)
+        current_volume = max(0.0, min(1.0, new_volume))
+        if voice_client.source and hasattr(voice_client.source, 'volume'):
+            voice_client.source.volume = current_volume
+        update_dashboard_status(guild.id if guild else None)
+        return {"success": True}
+
+    elif command == "previous" and voice_client and guild:
+        queue = get_queue(guild.id)
+        if queue.current_index > 0:
+            queue.manual_control = True
+            queue.current_index -= 1
+            prev_song = queue.get_current()
+            if queue.control_message:
+                try:
+                    await queue.control_message.delete()
+                    queue.control_message = None
+                except:
+                    pass
+            voice_client.stop()
+            try:
+                player = await YTDLSource.from_url(prev_song['url'], loop=bot.loop, stream=True, volume=current_volume)
+                voice_client.play(player, after=lambda e: asyncio.run_coroutine_threadsafe(play_next(guild, voice_client), bot.loop))
+                update_dashboard_status(guild.id)
+            except Exception as e:
+                return {"success": False, "error": str(e)}
+        return {"success": True}
+
+    elif command == "add_music" and data.get("url"):
+        url = data["url"]
+        # Reconectar se necessário
+        if not voice_client and last_voice_channel_id and active_guild_id:
+            try:
+                guild = bot.get_guild(active_guild_id)
+                if guild:
+                    channel = guild.get_channel(last_voice_channel_id)
+                    if channel:
+                        voice_client = await channel.connect(timeout=30.0, reconnect=True)
+            except:
+                pass
+
+        if voice_client:
+            if not guild:
+                guild = voice_client.guild
+            queue = get_queue(guild.id)
+            text_channel = guild.get_channel(last_text_channel_id) if last_text_channel_id else None
+            queue.loop = text_channel
+
+            try:
+                search_url = url
+                if is_spotify_url(url) and 'track' in url:
+                    track_query = extract_spotify_track(url)
+                    if track_query:
+                        search_url = track_query
+
+                partial_data = await bot.loop.run_in_executor(
+                    None, lambda u=search_url: ytdl.extract_info(u, download=False)
+                )
+
+                if partial_data:
+                    if 'entries' in partial_data and partial_data['entries']:
+                        partial_data = partial_data['entries'][0]
+
+                    song_data = {
+                        'url': search_url,
+                        'title': partial_data.get('title'),
+                        'webpage_url': partial_data.get('webpage_url', search_url),
+                        'duration': partial_data.get('duration', 0),
+                        'thumbnail': partial_data.get('thumbnail')
+                    }
+                    queue.add(song_data)
+
+                    if not voice_client.is_playing() and not voice_client.is_paused():
+                        current_song_start_time = time.time()
+                        songs_played_count += 1
+                        queue.current_index = len(queue.all_songs) - 1
+                        player = await YTDLSource.from_url(search_url, loop=bot.loop, stream=True, volume=current_volume)
+                        voice_client.play(player, after=lambda e: asyncio.run_coroutine_threadsafe(play_next(guild, voice_client), bot.loop))
+
+                        if text_channel:
+                            embed = discord.Embed(
+                                description=f"**🎵 Tocando Agora (via Dashboard)**\n{player.title}",
+                                color=0x2f3136
+                            )
+                            view = MusicControls(guild.id)
+                            message = await text_channel.send(embed=embed, view=view)
+                            queue.control_message = message
+                    else:
+                        if text_channel:
+                            position = len(queue.all_songs) - queue.current_index - 1
+                            embed = discord.Embed(
+                                description=f"**📝 Adicionado à fila (via Dashboard)**\n{song_data['title']}\n\n**Posição:** #{position}",
+                                color=0x2f3136
+                            )
+                            await text_channel.send(embed=embed)
+
+                    update_dashboard_status(guild.id)
+                    return {"success": True, "title": song_data['title']}
+            except Exception as e:
+                return {"success": False, "error": str(e)}
+
+    return {"success": False, "error": "Comando não reconhecido ou bot não conectado"}
+
+async def websocket_handler(websocket):
+    """Handler para conexões WebSocket"""
+    global next_client_id
+
+    # Registrar novo cliente
+    client_id = next_client_id
+    next_client_id += 1
+
+    websocket_clients[client_id] = {
+        "websocket": websocket,
+        "connected_at": time.time(),
+        "name": f"Usuário {client_id}",
+        "is_host": len(websocket_clients) == 0  # Primeiro a conectar é host
+    }
+
+    is_this_host = is_host(client_id)
+    print(f"🔌 Cliente #{client_id} conectado {'(HOST)' if is_this_host else ''}. Total: {len(websocket_clients)}")
+
+    # Enviar info inicial para o cliente
+    welcome_msg = {
+        "type": "welcome",
+        "client_id": client_id,
+        "is_host": is_this_host,
+        "users": get_users_list()
+    }
+    await websocket.send(json.dumps(welcome_msg))
+
+    # Notificar todos sobre novo usuário
+    await broadcast_users_update()
+
+    # Enviar status inicial
+    update_dashboard_status()
+
+    try:
+        async for message in websocket:
+            try:
+                cmd = json.loads(message)
+                command = cmd.get("command")
+                data = cmd.get("data", {})
+
+                # Comando para definir nome do usuário
+                if command == "set_name":
+                    new_name = data.get("name", f"Usuário {client_id}")
+                    websocket_clients[client_id]["name"] = new_name
+                    print(f"👤 Cliente #{client_id} agora é '{new_name}'")
+                    await broadcast_users_update()
+                    await websocket.send(json.dumps({"type": "response", "command": command, "success": True}))
+                    continue
+
+                print(f"📨 WebSocket comando de #{client_id}: {command}")
+
+                result = await handle_websocket_command(command, data)
+                await websocket.send(json.dumps({"type": "response", "command": command, **result}))
+            except json.JSONDecodeError:
+                await websocket.send(json.dumps({"type": "error", "message": "JSON inválido"}))
+    except websockets.exceptions.ConnectionClosed:
+        pass
+    finally:
+        # Remover cliente
+        was_host = is_host(client_id)
+        del websocket_clients[client_id]
+        print(f"🔌 Cliente #{client_id} desconectado. Total: {len(websocket_clients)}")
+
+        # Se era o host, notificar novo host
+        if was_host and websocket_clients:
+            new_host_id = get_host_client_id()
+            print(f"👑 Novo host: Cliente #{new_host_id}")
+
+        # Notificar todos sobre saída do usuário
+        if websocket_clients:
+            await broadcast_users_update()
+
+async def start_websocket_server():
+    """Inicia o servidor WebSocket"""
+    if not WEBSOCKET_AVAILABLE:
+        return
+    try:
+        # Obter IP local para exibir
+        import socket
+        hostname = socket.gethostname()
+        local_ip = socket.gethostbyname(hostname)
+
+        server = await websockets.serve(websocket_handler, WEBSOCKET_HOST, WEBSOCKET_PORT)
+        print(f"🌐 Servidor WebSocket iniciado!")
+        print(f"   Local: ws://localhost:{WEBSOCKET_PORT}")
+        print(f"   Rede:  ws://{local_ip}:{WEBSOCKET_PORT}")
+        return server
+    except Exception as e:
+        print(f"❌ Erro ao iniciar WebSocket: {e}")
+
 @bot.event
 async def on_ready():
     global active_guild_id
@@ -543,9 +917,14 @@ async def on_ready():
     print('------')
     await bot.tree.sync()
     print('Comandos slash sincronizados')
-    print(f'📁 Arquivo de comandos: {COMMAND_FILE}')
 
-    # Iniciar task de verificação de comandos do dashboard
+    # Iniciar servidor WebSocket
+    if WEBSOCKET_AVAILABLE:
+        await start_websocket_server()
+    else:
+        print(f'📁 Arquivo de comandos: {COMMAND_FILE}')
+
+    # Iniciar task de verificação de comandos do dashboard (fallback)
     if not check_dashboard_commands.is_running():
         check_dashboard_commands.start()
         print('✅ Task de verificação de comandos do dashboard iniciada')
@@ -553,8 +932,8 @@ async def on_ready():
 @tasks.loop(seconds=1)
 async def check_dashboard_commands():
     """Verifica comandos enviados pelo dashboard"""
-    global active_guild_id, active_voice_client
-    
+    global active_guild_id, active_voice_client, current_song_start_time, current_volume, songs_played_count
+
     try:
         # Debug: verificar se arquivo existe
         if os.path.exists(COMMAND_FILE):
@@ -568,24 +947,44 @@ async def check_dashboard_commands():
             command = cmd.get("command")
             data = cmd.get("data", {})
             print(f"📋 Comando recebido: {command}, dados: {data}")
-            
-            # Encontrar guild ativa com voice client
+
+            # Usar guild_id especificado ou encontrar automaticamente
+            target_guild_id = data.get("guild_id")
             voice_client = None
             guild = None
-            for g in bot.guilds:
-                print(f"🔍 Verificando guild: {g.name}, voice_client: {g.voice_client}")
-                if g.voice_client:
-                    voice_client = g.voice_client
-                    guild = g
-                    active_guild_id = g.id
-                    print(f"✅ Guild com voice client encontrada: {g.name}")
-                    break
-            
-            if not voice_client:
+
+            if target_guild_id:
+                # Usar guild específica
+                guild = bot.get_guild(target_guild_id)
+                if guild:
+                    voice_client = guild.voice_client
+                    active_guild_id = guild.id
+                    print(f"🎯 Usando guild específica: {guild.name}")
+            else:
+                # Encontrar guild ativa com voice client
+                for g in bot.guilds:
+                    if g.voice_client:
+                        voice_client = g.voice_client
+                        guild = g
+                        active_guild_id = g.id
+                        print(f"✅ Guild com voice client encontrada: {g.name}")
+                        break
+
+            if not voice_client and command not in ["select_guild"]:
                 print("❌ Nenhuma guild com voice client encontrada!")
                 print(f"   Guilds disponíveis: {[g.name for g in bot.guilds]}")
-            
-            if command == "skip" and voice_client:
+
+            # Comando para selecionar guild
+            if command == "select_guild":
+                new_guild_id = data.get("guild_id")
+                if new_guild_id:
+                    active_guild_id = new_guild_id
+                    new_guild = bot.get_guild(new_guild_id)
+                    if new_guild:
+                        print(f"🖥️ Guild selecionada: {new_guild.name}")
+                        update_dashboard_status(new_guild_id)
+
+            elif command == "skip" and voice_client:
                 if voice_client.is_playing() or voice_client.is_paused():
                     voice_client.stop()
                     print("⏭️ Música pulada via dashboard")
@@ -601,7 +1000,17 @@ async def check_dashboard_commands():
                     voice_client.resume()
                     print("▶️ Música retomada via dashboard")
                     update_dashboard_status(guild.id)
-                    
+
+            elif command == "volume" and voice_client:
+                global current_volume
+                new_volume = data.get("value", 0.5)
+                current_volume = max(0.0, min(1.0, new_volume))
+                # Atualizar volume do player atual se estiver tocando
+                if voice_client.source and hasattr(voice_client.source, 'volume'):
+                    voice_client.source.volume = current_volume
+                print(f"🔊 Volume alterado para: {int(current_volume * 100)}%")
+                update_dashboard_status(guild.id if guild else None)
+
             elif command == "previous" and voice_client and guild:
                 queue = get_queue(guild.id)
                 if queue.current_index > 0:
@@ -679,7 +1088,9 @@ async def check_dashboard_commands():
                             song_data = {
                                 'url': search_url,
                                 'title': partial_data.get('title'),
-                                'webpage_url': partial_data.get('webpage_url', search_url)
+                                'webpage_url': partial_data.get('webpage_url', search_url),
+                                'duration': partial_data.get('duration', 0),
+                                'thumbnail': partial_data.get('thumbnail')
                             }
 
                             queue.add(song_data)
@@ -688,8 +1099,11 @@ async def check_dashboard_commands():
                             # Se não está tocando, começar a tocar
                             was_playing = voice_client.is_playing() or voice_client.is_paused()
                             if not was_playing:
+                                import time
+                                current_song_start_time = time.time()
+                                songs_played_count += 1
                                 queue.current_index = len(queue.all_songs) - 1
-                                player = await YTDLSource.from_url(search_url, loop=bot.loop, stream=True)
+                                player = await YTDLSource.from_url(search_url, loop=bot.loop, stream=True, volume=current_volume)
                                 voice_client.play(player, after=lambda e: asyncio.run_coroutine_threadsafe(play_next(guild, voice_client), bot.loop))
                                 print(f"▶️ Tocando: {player.title}")
 
@@ -755,7 +1169,7 @@ async def play(interaction: discord.Interaction, url: str):
         return  # Interação já expirou
 
     try:
-        global last_voice_channel_id, last_text_channel_id, active_guild_id
+        global last_voice_channel_id, last_text_channel_id, active_guild_id, current_song_start_time, songs_played_count
 
         if not interaction.guild.voice_client:
             channel = interaction.user.voice.channel
@@ -829,15 +1243,20 @@ async def play(interaction: discord.Interaction, url: str):
                         first_song = {
                             'url': first_query,
                             'title': partial_data.get('title'),
-                            'webpage_url': partial_data.get('webpage_url', first_query)
+                            'webpage_url': partial_data.get('webpage_url', first_query),
+                            'duration': partial_data.get('duration', 0),
+                            'thumbnail': partial_data.get('thumbnail')
                         }
 
                         queue.add(first_song)
                         queue.current_index = 0
 
-                        player = await YTDLSource.from_url(first_query, loop=bot.loop, stream=True)
+                        import time
+                        current_song_start_time = time.time()
+                        songs_played_count += 1
+                        player = await YTDLSource.from_url(first_query, loop=bot.loop, stream=True, volume=current_volume)
                         voice_client.play(player, after=lambda e: asyncio.run_coroutine_threadsafe(play_next(interaction.guild, voice_client), bot.loop))
-                        
+
                         # Atualizar dashboard
                         update_dashboard_status(interaction.guild.id)
 
@@ -887,7 +1306,9 @@ async def play(interaction: discord.Interaction, url: str):
                         song_data = {
                             'url': search_query,
                             'title': partial_data.get('title'),
-                            'webpage_url': partial_data.get('webpage_url', search_query)
+                            'webpage_url': partial_data.get('webpage_url', search_query),
+                            'duration': partial_data.get('duration', 0),
+                            'thumbnail': partial_data.get('thumbnail')
                         }
 
                         queue.add(song_data)
@@ -984,7 +1405,9 @@ async def play(interaction: discord.Interaction, url: str):
             song_data = {
                 'url': url,
                 'title': partial_data.get('title'),
-                'webpage_url': partial_data.get('webpage_url', url)
+                'webpage_url': partial_data.get('webpage_url', url),
+                'duration': partial_data.get('duration', 0),
+                'thumbnail': partial_data.get('thumbnail')
             }
 
             if voice_client.is_playing() or voice_client.is_paused():
@@ -1008,10 +1431,14 @@ async def play(interaction: discord.Interaction, url: str):
                 queue.add(song_data)
                 queue.current_index = 0
 
+                import time
+                current_song_start_time = time.time()
+                songs_played_count += 1
+
                 await asyncio.sleep(0.5)
-                player = await YTDLSource.from_url(url, loop=bot.loop, stream=True)
+                player = await YTDLSource.from_url(url, loop=bot.loop, stream=True, volume=current_volume)
                 voice_client.play(player, after=lambda e: asyncio.run_coroutine_threadsafe(play_next(interaction.guild, voice_client), bot.loop))
-                
+
                 # Atualizar dashboard
                 update_dashboard_status(interaction.guild.id)
 
