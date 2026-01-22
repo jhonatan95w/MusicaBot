@@ -1,0 +1,26 @@
+# Ambiente
+.env
+
+# Cache e temporários
+.cache/
+.claude/
+
+# Arquivos de comunicação bot/dashboard
+.bot_status.json
+.bot_command.json
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+ENV/
+
+# IDE
+.vscode/
+.idea/
+
+# Logs
+*.log
